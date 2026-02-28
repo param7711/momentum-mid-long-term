@@ -2,8 +2,8 @@
 
 Backtrader port of the Pine strategy with two modes:
 
-1. **Original V6 signal mode** (default): single asset, behavior mirrors the prior V6 implementation.
-2. **Portfolio overlay mode** (`--overlay`): keeps V6 signal logic unchanged per symbol, and adds weekly ranking, breadth-based exposure, replacement logic, and capital allocation at the portfolio layer.
+1. **Original V6 signal mode** (default): single asset with dual-phase entry (early probe -> confirmation add).
+2. **Portfolio overlay mode** (`--overlay`): keeps V6 confirmation logic as high-conviction add-on, adds early probe entries, and preserves ranking/breadth/replacement/allocation modules.
 
 ## Install
 
@@ -45,7 +45,9 @@ python backtrader_hybrid_momentum.py \
 
 ## Overlay design highlights
 
-- **V6 engine preserved**: entry/exit logic and indicators are unchanged per symbol.
+- **Dual-phase entry**: early-trend probe entry first, then scale-in only when full V6 confirmation condition triggers.
+- **ATR stop upgrade**: probe entries use tighter stop (`1.2 * ATR`), upgraded to wider confirmation stop (`2.0 * ATR`) after scale-in.
+- **V6 confirmation preserved**: original long-confirmation condition is unchanged and now acts as the conviction add-on trigger.
 - **Weekly ranking**: computes a structural momentum score and ranks the universe.
 - **Breadth model**: maps eligible trend count to allowed exposure.
 - **Replacement flow**: replacement attempts are event-driven after V6-driven exits.

@@ -65,7 +65,14 @@ class V6SignalEngine:
     def ready(self) -> bool:
         return len(self.data) >= 252
 
-    def long_condition(self) -> bool:
+    def early_trend_condition(self) -> bool:
+        return (
+            self.ma20[0] > self.ma50[0]
+            and self.data.close[0] > self.ma100[0]
+            and self.ma50[0] > self.ma50[-5]
+        )
+
+    def confirmation_condition(self) -> bool:
         trend_aligned = (self.ma20[0] > self.ma50[0]) and (self.ma50[0] > self.ma200[0])
         bull_market = self.data.close[0] > self.ma200[0]
 
@@ -84,6 +91,15 @@ class V6SignalEngine:
         volatility_expansion = self.atr[0] > self.atr_ma[0]
 
         return volatility_expansion and (momentum_entry or golden_cross_entry or fvg_entry or swing_entry)
+
+    def entry_signals(self) -> Dict[str, bool]:
+        return {
+            "probe_entry": self.early_trend_condition(),
+            "confirm_entry": self.confirmation_condition(),
+        }
+
+    def long_condition(self) -> bool:
+        return self.confirmation_condition()
 
     def exit_flags(self, bars_in_trade: int, entry_price: float, proven_trend_pct: float, early_failure_bars: int) -> Tuple[bool, bool, bool]:
         profit_percent = ((self.data.close[0] - entry_price) / entry_price) * 100.0
@@ -172,6 +188,9 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
         min_position_weight=0.05,
         allow_margin_on_high_breadth=True,
         index_data_name="",
+        probe_size_fraction=0.35,
+        probe_stop_atr_mult=1.2,
+        confirm_stop_atr_mult=2.0,
     )
 
     def __init__(self) -> None:
@@ -187,6 +206,8 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
         self.eligible_count: int = 0
         self.allowed_exposure: float = self.p.base_exposure
         self.exited_this_bar: bool = False
+        self.probe_positions: set[bt.feeds.DataBase] = set()
+        self.pending_confirmation: set[bt.feeds.DataBase] = set()
 
         self.index_data = self._resolve_index_data(self.p.index_data_name)
 
@@ -281,6 +302,21 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
             return 0
         return max(1, int(math.floor(self.allowed_exposure / self.p.min_position_weight)))
 
+    def _portfolio_exposure(self) -> float:
+        holdings = self._current_holdings()
+        if not holdings:
+            return 0.0
+        portfolio_value = self.broker.getvalue()
+        gross = sum(abs(self.getposition(d).size * d.close[0]) for d in holdings)
+        return gross / max(portfolio_value, 1e-9)
+
+    def _target_shares(self, data: bt.feeds.DataBase) -> int:
+        portfolio_value = self.broker.getvalue()
+        target_count = max(1, self._target_position_count())
+        target_weight = self.allowed_exposure / target_count
+        target_value = portfolio_value * target_weight
+        return max(1, int(target_value / max(data.close[0], 1e-9)))
+
     def _holding_rank_valid(self, data: bt.feeds.DataBase) -> bool:
         rank = self.rank_map.get(data, 10_000)
         return rank <= self.p.exit_rank_threshold
@@ -303,13 +339,32 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
         if order.status == order.Completed:
             if order.isbuy():
                 self.entry_orders[data] = None
-                self.bars_in_trade[data] = 0
-                stop_price = order.executed.price * (1.0 - self.p.stop_loss_pct)
-                self.stop_orders[data] = self.sell(data=data, exectype=bt.Order.Stop, price=stop_price)
+                if self.getposition(data).size == order.executed.size:
+                    self.bars_in_trade[data] = 0
+                if self.stop_orders[data] is not None:
+                    self.cancel(self.stop_orders[data])
+                    self.stop_orders[data] = None
+
+                atr_mult = self.p.probe_stop_atr_mult if data in self.probe_positions else self.p.confirm_stop_atr_mult
+                if data in self.pending_confirmation:
+                    atr_mult = self.p.confirm_stop_atr_mult
+                    self.pending_confirmation.discard(data)
+                    self.probe_positions.discard(data)
+
+                stop_price = order.executed.price - (atr_mult * self.engines[data].atr[0])
+                stop_price = max(0.01, stop_price)
+                self.stop_orders[data] = self.sell(
+                    data=data,
+                    exectype=bt.Order.Stop,
+                    price=stop_price,
+                    size=self.getposition(data).size,
+                )
             elif order.issell():
                 if order == self.stop_orders[data]:
                     self.stop_orders[data] = None
                 self.entry_orders[data] = None
+                self.pending_confirmation.discard(data)
+                self.probe_positions.discard(data)
 
         if order.status in [order.Canceled, order.Margin, order.Rejected]:
             if order == self.entry_orders[data]:
@@ -356,7 +411,7 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
                 continue
             if not self.engines[data].ready():
                 continue
-            if not self.engines[data].long_condition():
+            if not self.engines[data].entry_signals()["probe_entry"]:
                 continue
             candidates.append(data)
         return candidates
@@ -373,6 +428,8 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
         portfolio_value = self.broker.getvalue()
 
         for data in holdings:
+            if data in self.probe_positions:
+                continue
             target_value = portfolio_value * target_weight
             current_value = self.getposition(data).size * data.close[0]
             delta_value = target_value - current_value
@@ -383,6 +440,30 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
             elif delta_size < 0:
                 self.sell(data=data, size=abs(delta_size))
 
+    def _process_confirmation_scale_ins(self) -> None:
+        for data in self.datas:
+            if self.index_data is not None and data == self.index_data:
+                continue
+            if data not in self.probe_positions:
+                continue
+            if self.entry_orders[data] is not None:
+                continue
+            pos = self.getposition(data)
+            if not pos.size:
+                continue
+            signals = self.engines[data].entry_signals()
+            if not signals["confirm_entry"]:
+                continue
+
+            target_size = self._target_shares(data)
+            remaining_size = max(0, target_size - pos.size)
+            if remaining_size <= 0:
+                self.probe_positions.discard(data)
+                continue
+
+            self.entry_orders[data] = self.buy(data=data, size=remaining_size)
+            self.pending_confirmation.add(data)
+
     def _bootstrap_entries_if_empty(self) -> None:
         holdings = self._current_holdings()
         if holdings:
@@ -392,7 +473,12 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
             return
 
         for data in self._candidate_list()[:max_positions]:
-            self.entry_orders[data] = self.buy(data=data)
+            if self._portfolio_exposure() >= self.allowed_exposure:
+                break
+            target_size = self._target_shares(data)
+            probe_size = max(1, int(target_size * self.p.probe_size_fraction))
+            self.entry_orders[data] = self.buy(data=data, size=probe_size)
+            self.probe_positions.add(data)
 
     def _run_replacements_after_exit(self) -> None:
         if not self.exited_this_bar:
@@ -414,7 +500,12 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
             candidate_score = self.score_map.get(candidate, -999.0)
             if candidate_score <= weakest_score + self.p.improvement_threshold:
                 continue
-            self.entry_orders[candidate] = self.buy(data=candidate)
+            if self._portfolio_exposure() >= self.allowed_exposure:
+                break
+            target_size = self._target_shares(candidate)
+            probe_size = max(1, int(target_size * self.p.probe_size_fraction))
+            self.entry_orders[candidate] = self.buy(data=candidate, size=probe_size)
+            self.probe_positions.add(candidate)
             entered += 1
 
     def _enforce_exposure_cap(self) -> None:
@@ -438,6 +529,7 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
             self._update_weekly_ranking_and_breadth()
 
         self._process_exits()
+        self._process_confirmation_scale_ins()
         self._bootstrap_entries_if_empty()
         self._run_replacements_after_exit()
         self._enforce_exposure_cap()
@@ -450,9 +542,16 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
             return
 
         pos = self.getposition(data)
-        if not pos.size and self.entry_orders[data] is None and engine.long_condition():
+        signals = engine.entry_signals()
+
+        if not pos.size and self.entry_orders[data] is None and signals["probe_entry"]:
             self.entry_orders[data] = self.buy(data=data)
+            self.probe_positions.add(data)
             return
+
+        if pos.size and data in self.probe_positions and self.entry_orders[data] is None and signals["confirm_entry"]:
+            self.entry_orders[data] = self.buy(data=data)
+            self.pending_confirmation.add(data)
 
         if pos.size:
             self.bars_in_trade[data] += 1
