@@ -191,6 +191,19 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
         probe_size_fraction=0.35,
         probe_stop_atr_mult=1.2,
         confirm_stop_atr_mult=2.0,
+        volatility_lookback=20,
+        rs_lookback=60,
+        sector_index_prefix="SECTOR_",
+        relative_strength_threshold=1.05,
+        max_sector_positions=4,
+        max_pyramid_adds=2,
+        min_bars_between_adds=10,
+        pyramid_add_fraction=0.25,
+        partial_profit_trigger=25.0,
+        partial_profit_take_fraction=0.30,
+        ma200_reentry_bars=3,
+        ma200_reentry_high_period=252,
+        exposure_smoothing_alpha=0.15,
     )
 
     def __init__(self) -> None:
@@ -208,8 +221,25 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
         self.exited_this_bar: bool = False
         self.probe_positions: set[bt.feeds.DataBase] = set()
         self.pending_confirmation: set[bt.feeds.DataBase] = set()
+        self.last_add_bar: Dict[bt.feeds.DataBase, int] = {d: -10_000 for d in self.datas}
+        self.pyramid_add_count: Dict[bt.feeds.DataBase, int] = {d: 0 for d in self.datas}
+        self.initial_entry_size: Dict[bt.feeds.DataBase, int] = {d: 0 for d in self.datas}
+        self.partial_taken: Dict[bt.feeds.DataBase, bool] = {d: False for d in self.datas}
+        self.breakeven_active: Dict[bt.feeds.DataBase, bool] = {d: False for d in self.datas}
+        self.reentry_above_ma200_count: Dict[bt.feeds.DataBase, int] = {d: 0 for d in self.datas}
+        self.raw_allowed_exposure: float = self.p.base_exposure
+        self.prev_allowed_exposure: float = self.p.base_exposure
+        self.current_day: int = 0
 
         self.index_data = self._resolve_index_data(self.p.index_data_name)
+        self.sector_index_data: Dict[str, bt.feeds.DataBase] = {}
+        self.sector_ma200: Dict[str, bt.Indicator] = {}
+        for d in self.datas:
+            name = d._name
+            if name.startswith(self.p.sector_index_prefix):
+                sector = name[len(self.p.sector_index_prefix):]
+                self.sector_index_data[sector] = d
+                self.sector_ma200[sector] = bt.ind.SMA(d.close, period=200)
 
     def _resolve_index_data(self, name: str):
         if not name:
@@ -247,9 +277,12 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
     def _update_weekly_ranking_and_breadth(self) -> None:
         scored: List[Tuple[bt.feeds.DataBase, float]] = []
         eligible = 0
-        for data in self.datas:
-            if self.index_data is not None and data == self.index_data:
-                continue
+        candidates = [
+            d for d in self.datas
+            if (self.index_data is None or d != self.index_data) and d in self.probe_positions and self.getposition(d).size
+        ]
+        weight_map = self._compute_target_weights(candidates)
+        for data in candidates:
             score = self._ranking_score(data)
             self.score_map[data] = score
             scored.append((data, score))
@@ -260,7 +293,7 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
         self.ranked_list = [d for d, _ in scored]
         self.rank_map = {d: idx + 1 for idx, d in enumerate(self.ranked_list)}
         self.eligible_count = eligible
-        self.allowed_exposure = self._compute_allowed_exposure(eligible)
+        self.raw_allowed_exposure = self._compute_allowed_exposure(eligible)
 
     def _compute_allowed_exposure(self, eligible_count: int) -> float:
         if eligible_count > 60:
@@ -310,11 +343,80 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
         gross = sum(abs(self.getposition(d).size * d.close[0]) for d in holdings)
         return gross / max(portfolio_value, 1e-9)
 
-    def _target_shares(self, data: bt.feeds.DataBase) -> int:
+    def _sector_of(self, data: bt.feeds.DataBase) -> str:
+        if hasattr(data, "sector"):
+            return str(getattr(data, "sector"))
+        name = data._name
+        if ":" in name:
+            return name.split(":", 1)[1]
+        return "UNKNOWN"
+
+    def _sector_entry_allowed(self, data: bt.feeds.DataBase) -> bool:
+        sector = self._sector_of(data)
+        index_data = self.sector_index_data.get(sector)
+        ma200 = self.sector_ma200.get(sector)
+        if index_data is None or ma200 is None or len(index_data) < 200:
+            return True
+        return index_data.close[0] > ma200[0]
+
+    def _sector_position_count(self, sector: str) -> int:
+        count = 0
+        for d in self._current_holdings():
+            if self._sector_of(d) == sector:
+                count += 1
+        return count
+
+    def _volatility(self, data: bt.feeds.DataBase) -> float:
+        lookback = self.p.volatility_lookback
+        if len(data) < lookback + 1:
+            return 1e-6
+        closes = list(data.close.get(size=lookback + 1))
+        rets = []
+        for i in range(1, len(closes)):
+            prev = closes[i - 1]
+            if prev == 0:
+                continue
+            rets.append((closes[i] / prev) - 1.0)
+        if not rets:
+            return 1e-6
+        mean = sum(rets) / len(rets)
+        var = sum((r - mean) ** 2 for r in rets) / max(1, len(rets) - 1)
+        return max(var ** 0.5, 1e-6)
+
+    def _relative_strength_ok(self, data: bt.feeds.DataBase) -> bool:
+        sector = self._sector_of(data)
+        index_data = self.sector_index_data.get(sector)
+        lookback = self.p.rs_lookback
+        if index_data is None or len(data) <= lookback or len(index_data) <= lookback:
+            return True
+        stock_ret = (data.close[0] / max(data.close[-lookback], 1e-9)) - 1.0
+        sector_ret = (index_data.close[0] / max(index_data.close[-lookback], 1e-9)) - 1.0
+        if sector_ret <= 0:
+            return stock_ret > 0
+        rs_ratio = stock_ret / sector_ret
+        return rs_ratio > self.p.relative_strength_threshold
+
+    def _compute_target_weights(self, candidates: List[bt.feeds.DataBase]) -> Dict[bt.feeds.DataBase, float]:
+        if not candidates:
+            return {}
+        n = max(len(self.ranked_list), 1)
+        raw: Dict[bt.feeds.DataBase, float] = {}
+        for d in candidates:
+            vol = self._volatility(d)
+            risk_weight = 1.0 / vol
+            rank = self.rank_map.get(d, n)
+            score = (n - rank + 1) / n
+            score = max(score, 1e-6)
+            alloc_mult = math.sqrt(score)
+            raw[d] = risk_weight * alloc_mult
+        total = sum(raw.values())
+        if total <= 0:
+            return {d: 0.0 for d in candidates}
+        return {d: (w / total) * self.allowed_exposure for d, w in raw.items()}
+
+    def _target_shares_from_weight(self, data: bt.feeds.DataBase, weight: float) -> int:
         portfolio_value = self.broker.getvalue()
-        target_count = max(1, self._target_position_count())
-        target_weight = self.allowed_exposure / target_count
-        target_value = portfolio_value * target_weight
+        target_value = portfolio_value * max(weight, 0.0)
         return max(1, int(target_value / max(data.close[0], 1e-9)))
 
     def _holding_rank_valid(self, data: bt.feeds.DataBase) -> bool:
@@ -341,6 +443,10 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
                 self.entry_orders[data] = None
                 if self.getposition(data).size == order.executed.size:
                     self.bars_in_trade[data] = 0
+                    self.initial_entry_size[data] = abs(order.executed.size)
+                    self.pyramid_add_count[data] = 0
+                    self.partial_taken[data] = False
+                    self.breakeven_active[data] = False
                 if self.stop_orders[data] is not None:
                     self.cancel(self.stop_orders[data])
                     self.stop_orders[data] = None
@@ -353,6 +459,8 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
 
                 stop_price = order.executed.price - (atr_mult * self.engines[data].atr[0])
                 stop_price = max(0.01, stop_price)
+                if self.breakeven_active[data]:
+                    stop_price = max(stop_price, self.getposition(data).price)
                 self.stop_orders[data] = self.sell(
                     data=data,
                     exectype=bt.Order.Stop,
@@ -363,8 +471,14 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
                 if order == self.stop_orders[data]:
                     self.stop_orders[data] = None
                 self.entry_orders[data] = None
-                self.pending_confirmation.discard(data)
-                self.probe_positions.discard(data)
+                if self.getposition(data).size <= 0:
+                    self.pending_confirmation.discard(data)
+                    self.probe_positions.discard(data)
+                    self.initial_entry_size[data] = 0
+                    self.pyramid_add_count[data] = 0
+                    self.partial_taken[data] = False
+                    self.breakeven_active[data] = False
+                    self.reentry_above_ma200_count[data] = 0
 
         if order.status in [order.Canceled, order.Margin, order.Rejected]:
             if order == self.entry_orders[data]:
@@ -374,9 +488,12 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
 
     def _process_exits(self) -> None:
         self.exited_this_bar = False
-        for data in self.datas:
-            if self.index_data is not None and data == self.index_data:
-                continue
+        candidates = [
+            d for d in self.datas
+            if (self.index_data is None or d != self.index_data) and d in self.probe_positions and self.getposition(d).size
+        ]
+        weight_map = self._compute_target_weights(candidates)
+        for data in candidates:
             pos = self.getposition(data)
             if not pos.size:
                 continue
@@ -413,6 +530,20 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
                 continue
             if not self.engines[data].entry_signals()["probe_entry"]:
                 continue
+            if not self._sector_entry_allowed(data):
+                continue
+            if not self._relative_strength_ok(data):
+                continue
+            sector = self._sector_of(data)
+            if self._sector_position_count(sector) >= self.p.max_sector_positions:
+                continue
+            if len(data) >= self.p.ma200_reentry_high_period:
+                if data.close[0] > self.engines[data].ma200[0]:
+                    self.reentry_above_ma200_count[data] += 1
+                else:
+                    self.reentry_above_ma200_count[data] = 0
+                if self.reentry_above_ma200_count[data] > 0 and self.reentry_above_ma200_count[data] < self.p.ma200_reentry_bars:
+                    continue
             candidates.append(data)
         return candidates
 
@@ -428,7 +559,7 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
         portfolio_value = self.broker.getvalue()
 
         for data in holdings:
-            if data in self.probe_positions:
+            if data in self.probe_positions or self.entry_orders[data] is not None:
                 continue
             target_value = portfolio_value * target_weight
             current_value = self.getposition(data).size * data.close[0]
@@ -441,9 +572,12 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
                 self.sell(data=data, size=abs(delta_size))
 
     def _process_confirmation_scale_ins(self) -> None:
-        for data in self.datas:
-            if self.index_data is not None and data == self.index_data:
-                continue
+        candidates = [
+            d for d in self.datas
+            if (self.index_data is None or d != self.index_data) and d in self.probe_positions and self.getposition(d).size
+        ]
+        weight_map = self._compute_target_weights(candidates)
+        for data in candidates:
             if data not in self.probe_positions:
                 continue
             if self.entry_orders[data] is not None:
@@ -455,7 +589,7 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
             if not signals["confirm_entry"]:
                 continue
 
-            target_size = self._target_shares(data)
+            target_size = self._target_shares_from_weight(data, weight_map.get(data, 0.0))
             remaining_size = max(0, target_size - pos.size)
             if remaining_size <= 0:
                 self.probe_positions.discard(data)
@@ -472,10 +606,12 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
         if max_positions <= 0:
             return
 
-        for data in self._candidate_list()[:max_positions]:
+        selected = self._candidate_list()[:max_positions]
+        weight_map = self._compute_target_weights(selected)
+        for data in selected:
             if self._portfolio_exposure() >= self.allowed_exposure:
                 break
-            target_size = self._target_shares(data)
+            target_size = self._target_shares_from_weight(data, weight_map.get(data, 0.0))
             probe_size = max(1, int(target_size * self.p.probe_size_fraction))
             self.entry_orders[data] = self.buy(data=data, size=probe_size)
             self.probe_positions.add(data)
@@ -494,7 +630,9 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
         weakest_score = self.score_map.get(weakest, -999.0) if weakest else -999.0
 
         entered = 0
-        for candidate in self._candidate_list():
+        replacement_candidates = self._candidate_list()
+        weight_map = self._compute_target_weights(replacement_candidates)
+        for candidate in replacement_candidates:
             if entered >= open_slots:
                 break
             candidate_score = self.score_map.get(candidate, -999.0)
@@ -502,11 +640,61 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
                 continue
             if self._portfolio_exposure() >= self.allowed_exposure:
                 break
-            target_size = self._target_shares(candidate)
+            target_size = self._target_shares_from_weight(candidate, weight_map.get(candidate, 0.0))
             probe_size = max(1, int(target_size * self.p.probe_size_fraction))
             self.entry_orders[candidate] = self.buy(data=candidate, size=probe_size)
             self.probe_positions.add(candidate)
             entered += 1
+
+    def _process_pyramiding(self) -> None:
+        for data in self._current_holdings():
+            if self.entry_orders[data] is not None:
+                continue
+            if self.pyramid_add_count[data] >= self.p.max_pyramid_adds:
+                continue
+            if self.current_day - self.last_add_bar[data] < self.p.min_bars_between_adds:
+                continue
+            if data.close[0] <= self.engines[data].ma50[0]:
+                continue
+            window = 50
+            if len(data) <= window:
+                continue
+            prev_high = max(data.high.get(size=window + 1)[:-1])
+            if data.close[0] <= prev_high:
+                continue
+
+            add_size = int(max(1, self.initial_entry_size[data] * self.p.pyramid_add_fraction))
+            if add_size <= 0:
+                continue
+            self.entry_orders[data] = self.buy(data=data, size=add_size)
+            self.pyramid_add_count[data] += 1
+            self.last_add_bar[data] = self.current_day
+
+    def _process_partial_profits(self) -> None:
+        for data in self._current_holdings():
+            if self.partial_taken[data]:
+                continue
+            if self.entry_orders[data] is not None:
+                continue
+            pos = self.getposition(data)
+            if pos.size <= 0:
+                continue
+            profit_pct = ((data.close[0] - pos.price) / max(pos.price, 1e-9)) * 100.0
+            if profit_pct < self.p.partial_profit_trigger:
+                continue
+            sell_size = int(max(1, pos.size * self.p.partial_profit_take_fraction))
+            if sell_size >= pos.size:
+                sell_size = max(1, pos.size - 1)
+            if sell_size <= 0:
+                continue
+            self.entry_orders[data] = self.sell(data=data, size=sell_size)
+            self.partial_taken[data] = True
+            self.breakeven_active[data] = True
+            if self.stop_orders[data] is not None:
+                self.cancel(self.stop_orders[data])
+                self.stop_orders[data] = None
+            stop_price = max(pos.price, data.close[0] - (self.p.confirm_stop_atr_mult * self.engines[data].atr[0]))
+            self.stop_orders[data] = self.sell(data=data, exectype=bt.Order.Stop, price=max(0.01, stop_price), size=pos.size - sell_size)
 
     def _enforce_exposure_cap(self) -> None:
         holdings = self._current_holdings()
@@ -528,8 +716,16 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
         if self._is_week_rollover() or not self.ranked_list:
             self._update_weekly_ranking_and_breadth()
 
+        self.allowed_exposure = (
+            (1.0 - self.p.exposure_smoothing_alpha) * self.prev_allowed_exposure
+            + self.p.exposure_smoothing_alpha * self.raw_allowed_exposure
+        )
+        self.prev_allowed_exposure = self.allowed_exposure
+
         self._process_exits()
+        self._process_partial_profits()
         self._process_confirmation_scale_ins()
+        self._process_pyramiding()
         self._bootstrap_entries_if_empty()
         self._run_replacements_after_exit()
         self._enforce_exposure_cap()
@@ -565,6 +761,7 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
                 self._close_position(data)
 
     def next(self) -> None:
+        self.current_day += 1
         if self.p.overlay_enabled:
             self._next_overlay()
         else:
