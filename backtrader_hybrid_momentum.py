@@ -227,6 +227,7 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
         self.partial_taken: Dict[bt.feeds.DataBase, bool] = {d: False for d in self.datas}
         self.breakeven_active: Dict[bt.feeds.DataBase, bool] = {d: False for d in self.datas}
         self.reentry_above_ma200_count: Dict[bt.feeds.DataBase, int] = {d: 0 for d in self.datas}
+        self.had_trade: Dict[bt.feeds.DataBase, bool] = {d: False for d in self.datas}
         self.raw_allowed_exposure: float = self.p.base_exposure
         self.prev_allowed_exposure: float = self.p.base_exposure
         self.current_day: int = 0
@@ -443,6 +444,7 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
                 self.entry_orders[data] = None
                 if self.getposition(data).size == order.executed.size:
                     self.bars_in_trade[data] = 0
+                    self.had_trade[data] = True
                     self.initial_entry_size[data] = abs(order.executed.size)
                     self.pyramid_add_count[data] = 0
                     self.partial_taken[data] = False
@@ -537,12 +539,16 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
             sector = self._sector_of(data)
             if self._sector_position_count(sector) >= self.p.max_sector_positions:
                 continue
-            if len(data) >= self.p.ma200_reentry_high_period:
+            if self.had_trade[data]:
                 if data.close[0] > self.engines[data].ma200[0]:
                     self.reentry_above_ma200_count[data] += 1
                 else:
                     self.reentry_above_ma200_count[data] = 0
-                if self.reentry_above_ma200_count[data] > 0 and self.reentry_above_ma200_count[data] < self.p.ma200_reentry_bars:
+                if self.reentry_above_ma200_count[data] < self.p.ma200_reentry_bars:
+                    continue
+                if len(data) < self.p.ma200_reentry_high_period:
+                    continue
+                if data.close[0] < self.engines[data].high52[0]:
                     continue
             candidates.append(data)
         return candidates
@@ -555,13 +561,13 @@ class HybridMomentumPortfolioOverlay(bt.Strategy):
         if not holdings:
             return
 
-        target_weight = self.allowed_exposure / max(1, len(holdings))
         portfolio_value = self.broker.getvalue()
+        weight_map = self._compute_target_weights(holdings)
 
         for data in holdings:
             if data in self.probe_positions or self.entry_orders[data] is not None:
                 continue
-            target_value = portfolio_value * target_weight
+            target_value = portfolio_value * weight_map.get(data, 0.0)
             current_value = self.getposition(data).size * data.close[0]
             delta_value = target_value - current_value
             delta_size = int(delta_value / max(data.close[0], 1e-9))
